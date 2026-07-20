@@ -17,9 +17,9 @@ except ImportError:  # pragma: no cover
     create_client = None
 
 try:
-    import anthropic as _anthropic
+    import openai as _openai
 except ImportError:  # pragma: no cover
-    _anthropic = None
+    _openai = None
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -27,7 +27,7 @@ load_dotenv(BASE_DIR / ".env")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY and create_client:
@@ -214,10 +214,10 @@ def _format_events(events: list[dict]) -> str:
 @app.post("/query")
 def query_events(req: QueryRequest):
     """Answer a natural-language question about a user's GitHub activity."""
-    if not ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
-    if _anthropic is None:
-        raise HTTPException(status_code=503, detail="anthropic package not installed")
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
+    if _openai is None:
+        raise HTTPException(status_code=503, detail="openai package not installed")
 
     db = get_supabase_client()
     result = (
@@ -235,16 +235,19 @@ def query_events(req: QueryRequest):
 
     events_text = _format_events(events)
 
-    client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    message = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+    client = _openai.OpenAI(api_key=OPENAI_API_KEY)
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
         max_tokens=1024,
-        system=(
-            "You are a work activity assistant. You have access to a developer's GitHub activity log. "
-            "Answer the user's question based only on the provided events. "
-            "Be concise and specific — mention dates, repos, branch names, and PR/issue numbers where relevant."
-        ),
         messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a work activity assistant. You have access to a developer's GitHub activity log. "
+                    "Answer the user's question based only on the provided events. "
+                    "Be concise and specific — mention dates, repos, branch names, and PR/issue numbers where relevant."
+                ),
+            },
             {
                 "role": "user",
                 "content": (
@@ -252,11 +255,11 @@ def query_events(req: QueryRequest):
                     f"{events_text}\n\n"
                     f"Question: {req.question}"
                 ),
-            }
+            },
         ],
     )
 
     return {
-        "answer": message.content[0].text,
+        "answer": response.choices[0].message.content,
         "events_used": len(events),
     }
