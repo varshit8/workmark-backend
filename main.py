@@ -8,12 +8,18 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
 try:
     from supabase import create_client
-except ImportError:  # pragma: no cover - keeps app importable in minimal environments
+except ImportError:  # pragma: no cover
     create_client = None
+
+try:
+    import anthropic as _anthropic
+except ImportError:  # pragma: no cover
+    _anthropic = None
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -21,12 +27,13 @@ load_dotenv(BASE_DIR / ".env")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY and create_client:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    except Exception:  # pragma: no cover - defensive guard for runtime misconfiguration
+    except Exception:  # pragma: no cover
         supabase = None
 
 app = FastAPI()
@@ -153,7 +160,7 @@ async def github_webhook(
         stored = True
     except Exception as e:
         if "duplicate key" in str(e):
-            stored = False  # already recorded, safe to ignore
+            stored = False
         else:
             raise
 
@@ -172,3 +179,84 @@ def get_events(username: str):
         .execute()
     )
     return result.data
+
+
+# ── LLM query endpoint ────────────────────────────────────────────────────────
+
+class QueryRequest(BaseModel):
+    username: str
+    question: str
+
+
+def _format_events(events: list[dict]) -> str:
+    lines = []
+    for e in events:
+        ts = (e.get("event_time") or "")[:19].replace("T", " ")
+        parts = [
+            ts,
+            f"{e['event_type']}.{e['event_action']}",
+            f"repo={e['repo_name']}",
+        ]
+        if e.get("branch_name"):
+            parts.append(f"branch={e['branch_name']}")
+        if e.get("pr_number"):
+            parts.append(f"PR#{e['pr_number']}")
+        if e.get("issue_number"):
+            parts.append(f"issue#{e['issue_number']}")
+        if e.get("commit_count"):
+            parts.append(f"{e['commit_count']} commits")
+        if e.get("safe_title"):
+            parts.append(f'"{e["safe_title"]}"')
+        lines.append("- " + " | ".join(parts))
+    return "\n".join(lines)
+
+
+@app.post("/query")
+def query_events(req: QueryRequest):
+    """Answer a natural-language question about a user's GitHub activity."""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    if _anthropic is None:
+        raise HTTPException(status_code=503, detail="anthropic package not installed")
+
+    db = get_supabase_client()
+    result = (
+        db.table("work_events")
+        .select("event_type,event_action,event_time,repo_name,branch_name,pr_number,issue_number,commit_count,safe_title")
+        .eq("github_username", req.username)
+        .order("event_time", desc=True)
+        .limit(200)
+        .execute()
+    )
+    events = result.data
+
+    if not events:
+        return {"answer": f"No activity found for user '{req.username}'.", "events_used": 0}
+
+    events_text = _format_events(events)
+
+    client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    message = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1024,
+        system=(
+            "You are a work activity assistant. You have access to a developer's GitHub activity log. "
+            "Answer the user's question based only on the provided events. "
+            "Be concise and specific — mention dates, repos, branch names, and PR/issue numbers where relevant."
+        ),
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    f"Here is the GitHub activity log for '{req.username}':\n\n"
+                    f"{events_text}\n\n"
+                    f"Question: {req.question}"
+                ),
+            }
+        ],
+    )
+
+    return {
+        "answer": message.content[0].text,
+        "events_used": len(events),
+    }
